@@ -1,0 +1,40 @@
+# Lightweight etcd monitoring for the demo (no Prometheus required)
+# This deploys a CronJob that logs etcd size every 30s
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: etcd-size-logger
+  namespace: kube-system
+spec:
+  schedule: "* * * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          hostNetwork: true
+          nodeSelector:
+            node-role.kubernetes.io/control-plane: ""
+          tolerations:
+          - effect: NoSchedule
+            key: node-role.kubernetes.io/control-plane
+          containers:
+          - name: checker
+            image: bitnami/etcd:3.5
+            command:
+            - /bin/sh
+            - -c
+            - |
+              etcdctl endpoint status --write-out=table \
+                --endpoints=https://localhost:2379 \
+                --cert=/etc/kubernetes/pki/etcd/peer.crt \
+                --key=/etc/kubernetes/pki/etcd/peer.key \
+                --cacert=/etc/kubernetes/pki/etcd/ca.crt
+            volumeMounts:
+            - name: etcd-certs
+              mountPath: /etc/kubernetes/pki/etcd
+              readOnly: true
+          volumes:
+          - name: etcd-certs
+            hostPath:
+              path: /etc/kubernetes/pki/etcd
+          restartPolicy: Never

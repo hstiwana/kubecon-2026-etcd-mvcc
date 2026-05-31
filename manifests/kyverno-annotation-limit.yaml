@@ -1,0 +1,30 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: limit-annotation-size
+  annotations:
+    policies.kyverno.io/title: Limit Pod Annotation Size
+    policies.kyverno.io/description: >-
+      Prevents pods from being created with annotations exceeding 10KB total.
+      This protects etcd from MVCC bloat caused by large annotations being
+      stored as full-object revisions on every update.
+spec:
+  validationFailureAction: Enforce
+  background: false
+  rules:
+  - name: check-annotation-size
+    match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+    validate:
+      message: >-
+        Total annotation size exceeds 10KB ({{request.object.metadata.annotations | to_string(@) | length(@)}} bytes).
+        Large annotations cause etcd MVCC bloat. Move high-churn data to a separate CRD.
+      deny:
+        conditions:
+          any:
+          - key: "{{ request.object.metadata.annotations | to_string(@) | length(@) }}"
+            operator: GreaterThan
+            value: 10240
