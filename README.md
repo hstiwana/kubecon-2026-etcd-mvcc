@@ -28,13 +28,17 @@ You'll see:
 # 1. Create cluster with reduced etcd quota
 ./demo.sh setup
 
+# If you already had this demo cluster, use this instead so kind picks up
+# the current 10-minute compaction window:
+RESET_CLUSTER=1 ./demo.sh setup
+
 # 2. In a second terminal, watch etcd fill up
 ./demo.sh monitor
 
-# 3. Start the annotation bomb
+# 3. Start the stage path: pod status patch storm
 ./demo.sh break
 
-# 4. Wait for cluster to go read-only (~2 min)
+# 4. Wait for cluster to go read-only (~1 min on a typical laptop)
 # 5. Try to do anything:
 kubectl create namespace test              # FAILS
 kubectl delete namespace mvcc-demo         # FAILS
@@ -54,11 +58,22 @@ kubectl run test --image=busybox           # FAILS
 
 ```
 $ ./demo.sh break
-[DEMO] Creating 50 pods, then patching each with 100KB configmaps...
-  Created 50 configmaps. etcd: 47.1 MB / 50 MB
-  Created 85 configmaps. etcd: 50.7 MB / 50 MB
-  error: failed to create configmap: etcdserver: mvcc: database space exceeded
-  error: failed to create configmap: etcdserver: mvcc: database space exceeded
+[DEMO] === SCENARIO: Status Patch Storm ===
+[DEMO] Replicas: 80 | payload: 96KiB/pod | parallelism: 20
+[DEMO] Patching status on 80 pods as fast as the API server accepts it...
+
+  Iteration 9 | elapsed 11s
+  etcd db size: 92.5 MB / 100.0 MB (92%)
+  etcd in-use:  89.7 MB
+  dead space:   2.8 MB
+  etcd alarm: none
+
+  Iteration 11 | elapsed 13s
+  etcd db size: 100.2 MB / 100.0 MB (100%)
+  etcd alarm: NOSPACE
+
+  kubectl get namespace mvcc-demo  # OK
+  Error from server: etcdserver: mvcc: database space exceeded
   ...
   WRITES BLOCKED - cluster is read-only!
 
@@ -72,6 +87,31 @@ $ kubectl run test --image=busybox
   Error from server: etcdserver: mvcc: database space exceeded
 ```
 
+## Stage Tuning
+
+The defaults are intentionally stage-biased:
+
+```bash
+STATUS_REPLICAS=80
+STATUS_PAYLOAD_BYTES=98304   # 96KiB condition message per pod
+STATUS_PARALLELISM=20
+STATUS_DEADLINE_SECONDS=90
+STATUS_IMAGE=registry.k8s.io/pause:3.10
+```
+
+If rehearsal does not cross quota fast enough, use one of these:
+
+```bash
+STATUS_REPLICAS=100 ./demo.sh break
+STATUS_PAYLOAD_BYTES=131072 ./demo.sh break
+```
+
+If your laptop is struggling, lower pressure but keep the compaction window at `10m`:
+
+```bash
+STATUS_REPLICAS=60 STATUS_PAYLOAD_BYTES=65536 ./demo.sh break
+```
+
 ### Recovery (validated):
 ```
 $ etcdctl alarm list
@@ -82,7 +122,7 @@ $ etcdctl compact 2253
 
 $ etcdctl defrag
   Finished defragmenting etcd member[...]
-  (50.7 MB → 21.8 MB)
+  (100.2 MB → 9.2 MB)
 
 $ etcdctl alarm disarm
   memberID:2583549131277751082 alarm:NOSPACE
@@ -240,18 +280,21 @@ This isolates high-frequency writes to objects that are small and disposable, ke
 
 | Scenario | What It Shows | Time to Break |
 |----------|--------------|---------------|
-| `break` | Annotation bomb - 50 pods × 100KB configmaps | ~90 seconds |
-| `break-status` | Status patch storm - simulates broken controller | ~3 minutes |
+| `break` | Stage path: pod status storm - simulates a broken controller | ~45-90 seconds |
+| `break-status` | Same as `break` | ~45-90 seconds |
+| `break-annotations` | Annotation patch storm for comparison | Hardware-dependent |
 | `recover` | Full recovery: compact → defrag → disarm | ~30 seconds |
 | `guardrails` | Kyverno policy + Prometheus alerts | Instant |
 
 ## Key Learnings from Building This Demo
 
-1. **Auto-compaction can mask the problem in demos.** If annotations cycle through the same keys (overwrite), compaction removes old revisions fast enough to keep up. In production, controllers create unique entries per reconcile cycle, which compaction can't help with. The demo uses unique keys per iteration to be realistic.
+1. **Auto-compaction can mask the problem in demos.** The first version used 30-second auto-compaction and small status messages, so etcd reused freed pages about as fast as the demo created new pressure. That is why a run can plateau around 40-50% instead of hitting NOSPACE. The kind config now uses a 10-minute compaction window so the stage demo finishes before old revisions are reclaimed.
 
 2. **Defrag is the missing step.** Compaction marks revisions as deleted but the physical db file doesn't shrink. You must defrag to reclaim space. This is why `etcd_mvcc_db_total_size_in_bytes` (physical) can be much larger than `etcd_mvcc_db_total_size_in_use_in_bytes` (logical).
 
-3. **Deletes are not fully blocked.** Individual object deletes (tombstone markers) sometimes succeed because they're smaller writes. But namespace deletion and any operation that triggers cascading writes will fail. This makes the failure confusing - "I can delete this configmap but not that namespace."
+3. **Reads still work after NOSPACE.** `kubectl get` can succeed even though all writes are rejected. The script checks `etcdctl alarm list` for `NOSPACE` and then demonstrates both sides: a successful read and a failed tiny write.
+
+4. **Deletes are not fully blocked.** Individual object deletes (tombstone markers) sometimes succeed because they're smaller writes. But namespace deletion and any operation that triggers cascading writes will fail. This makes the failure confusing - "I can delete this configmap but not that namespace."
 
 ## References
 

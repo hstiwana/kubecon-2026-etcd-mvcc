@@ -1,5 +1,6 @@
-# kind cluster config with reduced etcd quota for demo purposes
-# This makes the MVCC exhaustion reproducible in ~2 minutes instead of days
+# kind cluster config with reduced etcd quota for demo purposes.
+# This keeps the quota at 100MiB, but uses a compaction window longer than the
+# stage demo so status-update revisions visibly accumulate before recovery.
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 name: etcd-mvcc-demo
@@ -13,8 +14,9 @@ nodes:
         extraArgs:
           # 100MB quota — small enough to fill quickly during demo
           quota-backend-bytes: "104857600"
-          # Aggressive auto-compaction so we can show it's not enough
+          # Leave old revisions around long enough for a <1 minute stage demo.
+          # The recovery path still demonstrates manual compact + defrag.
           auto-compaction-mode: periodic
-          auto-compaction-retention: "30s"
+          auto-compaction-retention: "10m"
 - role: worker
 - role: worker
