@@ -58,12 +58,14 @@ spec:
     # Alert on high write rate — early warning
     - alert: EtcdHighWriteRate
       expr: |
-        rate(etcd_mvcc_put_total[5m]) > 100
+        rate(etcd_mvcc_put_total[5m])
+        > 3 * avg_over_time(rate(etcd_mvcc_put_total[5m])[7d:1h])
       for: 10m
       labels:
         severity: warning
       annotations:
-        summary: "etcd write rate is {{ $value }}/s — unusually high"
+        summary: "etcd write rate is >3x the cluster baseline"
         description: >
-          Sustained write rate above 100/s. Check for controllers with
-          aggressive reconcile loops or operators patching status too frequently.
+          Sustained write rate is more than 3x the 7-day baseline. Check for
+          controllers with aggressive reconcile loops or operators patching
+          status too frequently.

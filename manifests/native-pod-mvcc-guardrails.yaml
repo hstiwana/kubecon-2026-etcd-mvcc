@@ -1,0 +1,81 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: pod-mvcc-write-guardrails
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups:
+      - ""
+      apiVersions:
+      - v1
+      operations:
+      - CREATE
+      - UPDATE
+      resources:
+      - pods
+  validations:
+  - expression: >-
+      !has(object.metadata.annotations) ||
+      object.metadata.annotations.all(key,
+        key.size() + object.metadata.annotations[key].size() <= 10240
+      )
+    reason: RequestEntityTooLarge
+    message: >-
+      Pod annotation entries must be 10KiB or smaller. Large annotations cause
+      etcd MVCC bloat; move high-churn data to a separate CRD.
+  - expression: >-
+      !has(object.metadata.labels) ||
+      object.metadata.labels.all(key,
+        key.size() + object.metadata.labels[key].size() <= 2048
+      )
+    reason: RequestEntityTooLarge
+    message: >-
+      Pod label entries must be 2KiB or smaller. Labels are indexed and should
+      stay small and stable.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: pod-mvcc-write-guardrails
+spec:
+  policyName: pod-mvcc-write-guardrails
+  validationActions:
+  - Deny
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: pod-status-mvcc-guardrails
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups:
+      - ""
+      apiVersions:
+      - v1
+      operations:
+      - UPDATE
+      resources:
+      - pods/status
+  validations:
+  - expression: >-
+      !has(object.status.conditions) ||
+      object.status.conditions.all(condition,
+        !has(condition.message) || condition.message.size() <= 10240
+      )
+    reason: RequestEntityTooLarge
+    message: >-
+      Pod status condition messages must be 10KiB or smaller. High-churn status
+      payloads create full pod revisions in etcd.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: pod-status-mvcc-guardrails
+spec:
+  policyName: pod-status-mvcc-guardrails
+  validationActions:
+  - Deny

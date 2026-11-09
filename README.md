@@ -18,40 +18,30 @@ You'll see:
 - [kubectl](https://kubernetes.io/docs/tasks/tools/)
 - [Docker](https://docs.docker.com/get-docker/)
 - Python 3 (for generating test data)
-- Optional: [Kyverno](https://kyverno.io/) (for guardrail demo)
 
 **Minimum resources:** 4 vCPU, 8GB RAM (for 3-node kind cluster under write pressure)
 
 ## Quick Start
 
 ```bash
-# 1. Create cluster with reduced etcd quota
-./demo.sh setup
+# Guided stage flow: setup → size → break → recover → guardrails
+./demo.sh
 
 # If you already had this demo cluster, use this instead so kind picks up
 # the current 10-minute compaction window:
-RESET_CLUSTER=1 ./demo.sh setup
+RESET_CLUSTER=1 ./demo.sh
 
-# 2. In a second terminal, watch etcd fill up
+# When the guided flow asks, open a second terminal and run:
 ./demo.sh monitor
+```
 
-# 3. Start the stage path: pod status patch storm
+To run one section directly without the guided prompts:
+
+```bash
+./demo.sh setup
 ./demo.sh break
-
-# 4. Wait for cluster to go read-only (~1 min on a typical laptop)
-# 5. Try to do anything:
-kubectl create namespace test              # FAILS
-kubectl delete namespace mvcc-demo         # FAILS
-kubectl run test --image=busybox           # FAILS
-
-# 6. Recover
 ./demo.sh recover
-
-# 7. Deploy guardrails
 ./demo.sh guardrails
-
-# 8. Cleanup
-./demo.sh cleanup
 ```
 
 ## Validated Results
@@ -97,7 +87,73 @@ STATUS_PAYLOAD_BYTES=98304   # 96KiB condition message per pod
 STATUS_PARALLELISM=20
 STATUS_DEADLINE_SECONDS=90
 STATUS_IMAGE=registry.k8s.io/pause:3.10
+TEST_IMAGE=busybox:latest
+DEMO_PROMPT=<auto>         # no args: prompts on; explicit scenario: prompts off
+DEMO_COMMAND_PAUSE=<auto>  # no args: major; explicit scenario: 0
 ```
+
+To force or disable prompts:
+
+```bash
+DEMO_PROMPT=1 ./demo.sh break
+DEMO_PROMPT=0 ./demo.sh break
+```
+
+Command pause modes:
+
+```bash
+DEMO_PROMPT=1 DEMO_COMMAND_PAUSE=major ./demo.sh break  # balanced stage mode
+DEMO_PROMPT=1 DEMO_COMMAND_PAUSE=all ./demo.sh break    # pause before every shown command
+DEMO_PROMPT=1 DEMO_COMMAND_PAUSE=0 ./demo.sh break      # section prompts only
+```
+
+To run the admission guardrail demo:
+
+```bash
+./demo.sh guardrails
+```
+
+The stage path uses Kubernetes' built-in `ValidatingAdmissionPolicy`, so it does not install any add-on admission controller and does not need internet.
+
+## Offline Stage Mode
+
+Do not depend on conference Wi-Fi for the live demo. Prepare once while you have internet:
+
+```bash
+./demo.sh offline-prep
+RESET_CLUSTER=1 PRELOAD_IMAGES=1 ./demo.sh setup
+./demo.sh guardrails
+./demo.sh offline-check
+```
+
+That flow pulls the workload images for the kind node platform, preloads them into the kind worker nodes when the cluster exists, and verifies the laptop can run without fetching from registries during the talk. Monitoring and recovery use the kind control-plane container directly, so there is no separate etcd monitor image to pull.
+
+`offline-prep` detects the kind/Docker platform automatically, usually `linux/amd64` or `linux/arm64`, and pulls images for that platform.
+
+If you need to prepare on one machine and move the demo bundle to another, export/import the image cache:
+
+```bash
+# On the connected prep machine, after offline-prep:
+./demo.sh offline-export
+
+# Copy offline-assets/ to the demo laptop, then:
+./demo.sh offline-import
+```
+
+For the stage run, use:
+
+```bash
+./demo.sh
+```
+
+If you want to recreate the kind cluster while offline, pin and cache the kind node image ahead of time:
+
+```bash
+KIND_NODE_IMAGE=kindest/node:<version> ./demo.sh offline-prep
+KIND_NODE_IMAGE=kindest/node:<version> RESET_CLUSTER=1 PRELOAD_IMAGES=1 ./demo.sh setup
+```
+
+The lowest-risk stage path is to create and recover the kind cluster before the talk, then run the guided flow against that already-warm local cluster.
 
 If rehearsal does not cross quota fast enough, use one of these:
 
@@ -129,6 +185,9 @@ $ etcdctl alarm disarm
 
 $ kubectl create namespace recovery-test
   namespace/recovery-test created   ← cluster is back
+
+$ kubectl delete namespace recovery-test --wait=false
+  namespace "recovery-test" deleted
 ```
 
 ## Business Impact
@@ -197,7 +256,7 @@ etcdctl defrag
 etcdctl alarm disarm
 
 # 6. Verify
-kubectl create namespace test && kubectl delete namespace test
+kubectl create namespace test && kubectl delete namespace test --wait=false
 ```
 
 ## Prevention
@@ -240,11 +299,19 @@ rate(etcd_mvcc_put_total[5m]) > 3 * avg_over_time(rate(etcd_mvcc_put_total[5m])[
 # A broken controller was deployed, an operator is stuck in a loop, etc.
 ```
 
-**Why not a fixed write rate threshold?** Because "normal" depends entirely on cluster size. A 10,000-node cluster generates ~250 writes/sec just from node lease renewals alone (10,000 nodes / 40s lease interval). A 50-node cluster might see 5 writes/sec normally. A fixed threshold like "alert at 100/sec" would either never fire on large clusters or constantly fire on them. The 3x-baseline approach catches anomalous spikes (broken controller, runaway operator) without false-alerting, regardless of cluster size.
+**Why not a fixed write rate threshold?** Because "normal" depends entirely on cluster size. A 10,000-node cluster generates ~1,000 writes/sec just from node lease renewals alone (10,000 nodes / 10s lease update interval). A 50-node cluster might see 5 writes/sec normally. A fixed threshold like "alert at 100/sec" would either never fire on large clusters or constantly fire on them. The 3x-baseline approach catches anomalous spikes (broken controller, runaway operator) without false-alerting, regardless of cluster size.
 
-### 2. Admission Guardrails (manifests/kyverno-annotation-limit.yaml)
+### 2. Admission Guardrails (manifests/native-pod-mvcc-guardrails.yaml)
 
-Reject pods with annotations exceeding 10KB at admission time. Stops the problem at the source.
+Use Kubernetes' built-in `ValidatingAdmissionPolicy` to reject known high-risk pod writes before they become etcd revisions:
+
+- pod annotation entries over 10KiB
+- pod label entries over 2KiB
+- pod status condition messages over 10KiB on the `pods/status` subresource
+
+This catches both common metadata bloat and the status-patch storm used in the demo, without installing a third-party admission controller. It is not a claim that annotations are the only risk; unexpected write paths still need audit-log grouping by resource/user-agent and write-rate alerts against the cluster's own baseline.
+
+Advanced production option: teams that already run Kyverno, or need richer policy lifecycle controls, can express the same CEL checks as Kyverno `ValidatingPolicy` resources. That adds policy-as-code packaging, background scans, PolicyReports, fine-grained PolicyExceptions, namespace-scoped policy ownership, CLI/unit testing, and optional generation of native `ValidatingAdmissionPolicy` objects. The stage demo stays native so it has no add-on or internet dependency, but Kyverno is a strong implementation path when you need central policy governance across many clusters.
 
 ### 3. Best Practices
 
@@ -280,11 +347,15 @@ This isolates high-frequency writes to objects that are small and disposable, ke
 
 | Scenario | What It Shows | Time to Break |
 |----------|--------------|---------------|
+| `guided` or no argument | Full stage flow with prompts: setup → size → break → recover → guardrails | End-to-end |
 | `break` | Stage path: pod status storm - simulates a broken controller | ~45-90 seconds |
-| `break-status` | Same as `break` | ~45-90 seconds |
 | `break-annotations` | Annotation patch storm for comparison | Hardware-dependent |
 | `recover` | Full recovery: compact → defrag → disarm | ~30 seconds |
-| `guardrails` | Kyverno policy + Prometheus alerts | Instant |
+| `guardrails` | Native admission policy + Prometheus alerts | Instant |
+| `offline-prep` | Cache manifests/images before the conference | Prep step |
+| `offline-check` | Verify no live internet dependency remains | Prep step |
+| `offline-export` | Save cached demo images into `offline-assets/demo-images.tar` | Prep step |
+| `offline-import` | Load cached demo images from `offline-assets/demo-images.tar` | Prep step |
 
 ## Key Learnings from Building This Demo
 
@@ -301,7 +372,8 @@ This isolates high-frequency writes to objects that are small and disposable, ke
 - [etcd documentation: Space quota](https://etcd.io/docs/v3.5/op-guide/maintenance/#space-quota)
 - [Kubernetes: Configure and upgrade etcd](https://kubernetes.io/docs/tasks/administer-cluster/configure-upgrade-etcd/)
 - [KEP-4222: CBOR Serialization](https://github.com/kubernetes/enhancements/issues/4222) (future improvement, ~30% size reduction)
-- [Kyverno: Validation Policies](https://kyverno.io/docs/writing-policies/validate/)
+- [Kubernetes: ValidatingAdmissionPolicy](https://kubernetes.io/docs/reference/access-authn-authz/validating-admission-policy/)
+- [Kyverno: ValidatingPolicy](https://kyverno.io/docs/policy-types/validating-policy/)
 
 ## License
 
