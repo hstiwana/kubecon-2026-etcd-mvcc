@@ -368,7 +368,7 @@ This isolates high-frequency writes to objects that are small and disposable, ke
 | `offline-export` | Save cached demo images into `offline-assets/demo-images.tar` | Prep step |
 | `offline-import` | Load cached demo images from `offline-assets/demo-images.tar` | Prep step |
 
-## Key Learnings from Building This Demo
+## Key Learnings from this demo
 
 1. **Auto-compaction can mask the problem in demos.** The first version used 30-second auto-compaction and small status messages, so etcd reused freed pages about as fast as the demo created new pressure. That is why a run can plateau around 40-50% instead of hitting NOSPACE. The kind config now uses a 10-minute compaction window so the stage demo finishes before old revisions are reclaimed.
 
