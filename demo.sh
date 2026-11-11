@@ -22,6 +22,11 @@ STATUS_PARALLELISM="${STATUS_PARALLELISM:-20}"
 STATUS_DEADLINE_SECONDS="${STATUS_DEADLINE_SECONDS:-90}"
 STATUS_PATCH_TYPE="${STATUS_PATCH_TYPE:-strategic}"
 STATUS_IMAGE="${STATUS_IMAGE:-registry.k8s.io/pause:3.10}"
+ANNOTATION_REPLICAS="${ANNOTATION_REPLICAS:-50}"
+ANNOTATION_PAYLOAD_BYTES="${ANNOTATION_PAYLOAD_BYTES:-98304}"
+ANNOTATION_PARALLELISM="${ANNOTATION_PARALLELISM:-25}"
+ANNOTATION_SLEEP_SECONDS="${ANNOTATION_SLEEP_SECONDS:-0}"
+ANNOTATION_DEADLINE_SECONDS="${ANNOTATION_DEADLINE_SECONDS:-90}"
 TEST_IMAGE="${TEST_IMAGE:-busybox:latest}"
 RESET_CLUSTER="${RESET_CLUSTER:-0}"
 PRELOAD_IMAGES="${PRELOAD_IMAGES:-0}"
@@ -44,6 +49,7 @@ if [[ -z "${DEMO_COMMAND_PAUSE:-}" ]]; then
         DEMO_COMMAND_PAUSE=0
     fi
 fi
+DEMO_SECTION_PROMPT="${DEMO_SECTION_PROMPT:-1}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -92,7 +98,7 @@ confirm_action() {
         echo "  - $line"
     done
 
-    if [[ "$DEMO_PROMPT" == "0" || ! -t 0 ]]; then
+    if [[ "$DEMO_SECTION_PROMPT" == "0" || "$DEMO_PROMPT" == "0" || ! -t 0 ]]; then
         return 0
     fi
 
@@ -467,14 +473,158 @@ native_admission_policy_resource() {
         awk '$1 == "validatingadmissionpolicies"'
 }
 
+validating_admission_policy_plugin_enabled() {
+    local command
+    command=$(kubectl -n kube-system get pod -l component=kube-apiserver \
+        -o jsonpath='{range .items[0].spec.containers[0].command[*]}{.}{"\n"}{end}' 2>/dev/null || true)
+
+    if grep -q -- '^--disable-admission-plugins=.*ValidatingAdmissionPolicy' <<<"$command"; then
+        return 1
+    fi
+
+    if grep -q -- '^--enable-admission-plugins=.*ValidatingAdmissionPolicy' <<<"$command"; then
+        return 0
+    fi
+
+    # Recent Kubernetes versions can enable this admission plugin by default.
+    # Let the server-side dry-run rejection be the final authority.
+    return 0
+}
+
+wait_for_apiserver_ready() {
+    local deadline=$((SECONDS + 90))
+
+    while true; do
+        if kubectl get --raw=/readyz >/dev/null 2>&1; then
+            return 0
+        fi
+        if (( SECONDS >= deadline )); then
+            return 1
+        fi
+        sleep 2
+    done
+}
+
+enable_validating_admission_policy_live() {
+    local node="${CLUSTER_NAME}-control-plane"
+
+    if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$node"; then
+        warn "Cannot patch kube-apiserver live because kind control-plane container '$node' is not running."
+        return 1
+    fi
+
+    show_key_cmd "docker exec $node sh -c 'add ValidatingAdmissionPolicy to /etc/kubernetes/manifests/kube-apiserver.yaml'"
+    docker exec "$node" sh -c '
+set -eu
+manifest=/etc/kubernetes/manifests/kube-apiserver.yaml
+tmp=$(mktemp /tmp/kube-apiserver.XXXXXX)
+if grep -q -- "--enable-admission-plugins=.*ValidatingAdmissionPolicy" "$manifest"; then
+    exit 0
+fi
+if grep -q -- "--enable-admission-plugins=" "$manifest"; then
+    awk '"'"'
+        /--enable-admission-plugins=/ && $0 !~ /ValidatingAdmissionPolicy/ {
+            print $0 ",ValidatingAdmissionPolicy"
+            next
+        }
+        { print }
+    '"'"' "$manifest" > "$tmp"
+else
+    awk '"'"'
+        { print }
+        /- kube-apiserver$/ && !done {
+            print "    - --enable-admission-plugins=NodeRestriction,ValidatingAdmissionPolicy"
+            done=1
+        }
+    '"'"' "$manifest" > "$tmp"
+fi
+mv "$tmp" "$manifest"
+'
+
+    log "kube-apiserver static pod manifest updated; waiting for API server restart..."
+    if wait_for_apiserver_ready; then
+        log "kube-apiserver is ready again."
+        return 0
+    fi
+
+    warn "kube-apiserver did not become ready after the live admission-plugin patch."
+    return 1
+}
+
+guardrail_denial_seen() {
+    grep -qiE "denied the request|RequestEntityTooLarge|10KiB|Large annotations cause|Pod annotation entries"
+}
+
+status_guardrail_denial_seen() {
+    grep -qiE "ValidatingAdmissionPolicy|RequestEntityTooLarge|10KiB|status condition messages|High-churn status payloads"
+}
+
+status_guardrail_installed() {
+    kubectl get validatingadmissionpolicybinding pod-status-mvcc-guardrails >/dev/null 2>&1
+}
+
+metadata_guardrail_installed() {
+    kubectl get validatingadmissionpolicybinding pod-mvcc-write-guardrails >/dev/null 2>&1
+}
+
+native_guardrails_installed() {
+    metadata_guardrail_installed || status_guardrail_installed
+}
+
+remove_native_guardrails_for_vulnerable_demo() {
+    if ! native_guardrails_installed; then
+        return 0
+    fi
+
+    warn "Existing admission guardrails are installed."
+    warn "Guided mode removes them before the vulnerable-path break, then reapplies them at the end."
+    show_key_cmd "kubectl delete validatingadmissionpolicybinding pod-mvcc-write-guardrails pod-status-mvcc-guardrails --ignore-not-found"
+    kubectl delete validatingadmissionpolicybinding \
+        pod-mvcc-write-guardrails \
+        pod-status-mvcc-guardrails \
+        --ignore-not-found >/dev/null 2>&1 || true
+    show_key_cmd "kubectl delete validatingadmissionpolicy pod-mvcc-write-guardrails pod-status-mvcc-guardrails --ignore-not-found"
+    kubectl delete validatingadmissionpolicy \
+        pod-mvcc-write-guardrails \
+        pod-status-mvcc-guardrails \
+        --ignore-not-found >/dev/null 2>&1 || true
+}
+
+wait_for_guardrail_enforcement() {
+    local blob
+    local output=""
+    local deadline=$((SECONDS + 20))
+    blob=$(python3 -c "print('x' * 51200)")
+
+    show_cmd "kubectl run guardrail-readiness --image=$TEST_IMAGE -n $NAMESPACE --annotations=bloat.demo/huge=<50KiB> --dry-run=server -- sleep 1"
+    while true; do
+        output=$(kubectl run guardrail-readiness --image="$TEST_IMAGE" -n "$NAMESPACE" \
+            --annotations="bloat.demo/huge=$blob" \
+            --dry-run=server \
+            --command -- sleep 1 2>&1 || true)
+
+        if guardrail_denial_seen <<<"$output"; then
+            echo "$output" | sed 's/^/  /'
+            return 0
+        fi
+
+        if (( SECONDS >= deadline )); then
+            echo "$output" | sed 's/^/  /'
+            return 1
+        fi
+        sleep 1
+    done
+}
+
 wait_for_status_pods() {
+    local expected="${1:-$STATUS_REPLICAS}"
     local deadline=$((SECONDS + 60))
     local count=0
 
     while true; do
         count=$(kubectl get pods -n "$NAMESPACE" -l app=status-victim \
             --no-headers 2>/dev/null | awk 'END {print NR + 0}')
-        if (( count >= STATUS_REPLICAS )); then
+        if (( count >= expected )); then
             echo "$count"
             return 0
         fi
@@ -486,16 +636,68 @@ wait_for_status_pods() {
     done
 }
 
+namespace_terminating() {
+    [[ "$(kubectl get namespace "$NAMESPACE" -o jsonpath='{.metadata.deletionTimestamp}' 2>/dev/null || true)" != "" ]]
+}
+
+wait_for_label_to_clear() {
+    local label="$1"
+    local description="$2"
+    local deadline=$((SECONDS + 60))
+    local count=0
+
+    while true; do
+        count=$(kubectl get pods -n "$NAMESPACE" -l "$label" --no-headers 2>/dev/null | awk 'END {print NR + 0}')
+        if (( count == 0 )); then
+            return 0
+        fi
+        if (( SECONDS >= deadline )); then
+            warn "$count old $description pod(s) are still present after 60s."
+            return 1
+        fi
+        sleep 2
+    done
+}
+
+cleanup_status_workload() {
+    show_cmd "kubectl delete deployment status-victim -n $NAMESPACE --ignore-not-found --wait=false"
+    kubectl delete deployment status-victim -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    show_cmd "kubectl delete pod -l app=status-victim -n $NAMESPACE --ignore-not-found --wait=false --grace-period=0"
+    kubectl delete pod -l app=status-victim -n "$NAMESPACE" --ignore-not-found --wait=false --grace-period=0 >/dev/null 2>&1 || true
+}
+
+cleanup_annotation_workload() {
+    show_cmd "kubectl delete pod -l app=annotation-victim -n $NAMESPACE --ignore-not-found --wait=false --grace-period=0"
+    kubectl delete pod -l app=annotation-victim -n "$NAMESPACE" --ignore-not-found --wait=false --grace-period=0 >/dev/null 2>&1 || true
+}
+
+cleanup_recovered_storm_workload() {
+    log "Cleaning up the recovered status-storm workload..."
+    cleanup_status_workload
+    wait_for_label_to_clear "app=status-victim" "status-victim" || \
+        warn "Status-storm pods are still deleting; the next scenario reset will wait again."
+}
+
 reset_demo_namespace() {
-    log "Resetting demo namespace..."
-    show_cmd "kubectl delete namespace $NAMESPACE --ignore-not-found --wait=true --timeout=90s"
-    kubectl delete namespace "$NAMESPACE" \
-        --ignore-not-found \
-        --wait=true \
-        --timeout=90s >/dev/null 2>&1 || \
-        warn "Namespace reset did not fully finish; continuing with a best-effort setup."
+    log "Resetting demo workloads..."
     show_cmd "kubectl create namespace $NAMESPACE"
     kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+
+    if namespace_terminating; then
+        err "Namespace '$NAMESPACE' is already Terminating from an earlier namespace delete."
+        warn "Do not wait on namespace deletion during the demo; it can hang on terminating pods/final cleanup."
+        warn "Fastest recovery for rehearsal: ./demo.sh cleanup && ./demo.sh setup"
+        return 1
+    fi
+
+    cleanup_status_workload
+    cleanup_annotation_workload
+    show_cmd "kubectl delete pod guardrail-test guardrail-status-test -n $NAMESPACE --ignore-not-found --wait=false --grace-period=0"
+    kubectl delete pod guardrail-test guardrail-status-test -n "$NAMESPACE" --ignore-not-found --wait=false --grace-period=0 >/dev/null 2>&1 || true
+
+    log "Waiting for old demo pods to clear so counts are deterministic..."
+    wait_for_label_to_clear "app=status-victim" "status-victim" || return 1
+    wait_for_label_to_clear "app=annotation-victim" "annotation-victim" || return 1
 }
 
 # --- SETUP ---
@@ -515,7 +717,7 @@ setup() {
             create_kind_cluster
         else
             warn "kind cluster '$CLUSTER_NAME' already exists; reusing it."
-            warn "If it predates this script, run 'RESET_CLUSTER=1 ./demo.sh setup' to pick up the 10m compaction window."
+            warn "If it predates this script, run 'RESET_CLUSTER=1 ./demo.sh setup' only when you need a clean etcd compaction window."
         fi
     else
         log "Creating kind cluster with 100MB etcd quota..."
@@ -567,49 +769,117 @@ check_etcd_size() {
     fi
 }
 
-# --- BREAK: Annotation Bomb ---
+# --- BREAK: Annotation Storm ---
 break_annotations() {
-    log "=== SCENARIO: Annotation Bomb ==="
-    log "Creating 50 pods, then patching each with 50KB annotations every 2s"
-    log "This simulates a misbehaving controller that stores state in annotations"
+    log "=== SCENARIO: Annotation Storm (break-annotations) ==="
+    log "High-churn pod annotation patches fill etcd with full-object revisions"
     log ""
     warn "Watch etcd grow: run './demo.sh monitor' in another terminal"
     log ""
-    confirm_action "Annotation storm will:" \
-        "Create 50 test pods using image '$TEST_IMAGE' in namespace '$NAMESPACE'" \
-        "Patch each pod with a 50KiB annotation every 2 seconds" \
-        "Stop when etcd reports the NOSPACE alarm"
+
+    local metadata_guardrail_active=0
+    local annotation_pod_count="$ANNOTATION_REPLICAS"
+    if metadata_guardrail_installed; then
+        metadata_guardrail_active=1
+        annotation_pod_count=1
+        warn "Metadata guardrail is installed. This run should fail at admission before etcd grows."
+    fi
+
+    if [[ "$metadata_guardrail_active" == "1" ]]; then
+        log "Guarded probe: 1 pod | annotation payload: $((ANNOTATION_PAYLOAD_BYTES / 1024))KiB | unguarded storm defaults to $ANNOTATION_REPLICAS pods"
+        confirm_action "Guarded annotation storm will:" \
+            "Reset demo-owned workloads in namespace '$NAMESPACE'" \
+            "Create one annotation-victim pod using image '$TEST_IMAGE'" \
+            "Attempt one $((ANNOTATION_PAYLOAD_BYTES / 1024))KiB annotation patch" \
+            "Stop after the admission denial proves the guardrail works"
+    else
+        log "Creating $ANNOTATION_REPLICAS pods, then patching each with changing $((ANNOTATION_PAYLOAD_BYTES / 1024))KiB annotations"
+        log "Parallelism: $ANNOTATION_PARALLELISM | sleep: ${ANNOTATION_SLEEP_SECONDS}s | deadline: ${ANNOTATION_DEADLINE_SECONDS}s"
+        confirm_action "Annotation storm will:" \
+            "Reset demo-owned workloads in namespace '$NAMESPACE'" \
+            "Create $ANNOTATION_REPLICAS test pods using image '$TEST_IMAGE'" \
+            "Patch each pod with a changing $((ANNOTATION_PAYLOAD_BYTES / 1024))KiB annotation" \
+            "Stop when etcd reports the NOSPACE alarm or $ANNOTATION_DEADLINE_SECONDS seconds elapse"
+    fi
+
+    reset_demo_namespace
 
     # Create pods
-    log "Creating 50 pods..."
-    show_key_cmd "for i in \$(seq 1 50); do kubectl run victim-\$i --image=$TEST_IMAGE --namespace=$NAMESPACE -- sleep 3600; done"
-    for i in $(seq 1 50); do
+    log "Creating $annotation_pod_count annotation-victim pod(s)..."
+    show_key_cmd "for i in \$(seq 1 $annotation_pod_count); do kubectl run victim-\$i --image=$TEST_IMAGE --namespace=$NAMESPACE --labels=app=annotation-victim -- sleep 3600; done"
+    for i in $(seq 1 "$annotation_pod_count"); do
         kubectl run "victim-$i" --image="$TEST_IMAGE" --namespace=$NAMESPACE \
+            --labels=app=annotation-victim \
             --command -- sleep 3600 2>/dev/null &
     done
     wait
-    log "50 pods created. Waiting for them to be Running..."
-    show_cmd "kubectl wait --for=condition=Ready pod --all -n $NAMESPACE --timeout=120s"
-    kubectl wait --for=condition=Ready pod --all -n $NAMESPACE --timeout=120s 2>/dev/null || true
-
-    # Generate a 50KB annotation value
-    BLOB=$(python3 -c "print('x' * 51200)")
+    log "$annotation_pod_count pod(s) created. Waiting for them to be Running..."
+    show_cmd "kubectl wait --for=condition=Ready pod -l app=annotation-victim -n $NAMESPACE --timeout=120s"
+    kubectl wait --for=condition=Ready pod -l app=annotation-victim -n $NAMESPACE --timeout=120s 2>/dev/null || true
 
     log ""
     log "Starting annotation storm... (Ctrl+C to stop)"
-    log "Each patch writes the ENTIRE pod object (~65KB with annotation) as a new etcd revision"
-    show_key_cmd "kubectl annotate pod victim-<n> -n $NAMESPACE bloat.demo/data-<k>=<50KiB> --overwrite"
+    log "Each patch changes bytes, so it writes the ENTIRE pod object as a new etcd revision"
+    show_key_cmd "kubectl patch pod victim-<n> -n $NAMESPACE --type=merge --patch-file=<${ANNOTATION_PAYLOAD_BYTES}B annotation payload>"
     log ""
 
     local iteration=0
+    local start_ts
+    start_ts=$(date +%s)
     while true; do
         iteration=$((iteration + 1))
-        for i in $(seq 1 50); do
-            kubectl annotate pod "victim-$i" -n $NAMESPACE \
-                "bloat.demo/data-$((iteration % 5))=$BLOB" \
-                --overwrite 2>/dev/null &
+        local err_file
+        local patch_file
+        local launched=0
+        err_file=$(mktemp "${TMPDIR:-/tmp}/mvcc-annotation-errors.XXXXXX")
+        patch_file=$(mktemp "${TMPDIR:-/tmp}/mvcc-annotation-patch.XXXXXX")
+        write_annotation_patch_file "$iteration" "$patch_file"
+
+        for i in $(seq 1 "$annotation_pod_count"); do
+            kubectl patch pod "victim-$i" -n "$NAMESPACE" \
+                --type=merge \
+                --patch-file="$patch_file" >/dev/null 2>>"$err_file" &
+            launched=$((launched + 1))
+            if (( launched % ANNOTATION_PARALLELISM == 0 )); then
+                wait || true
+            fi
         done
-        wait
+        wait || true
+        rm -f "$patch_file"
+
+        if [[ -s "$err_file" ]]; then
+            echo ""
+            if grep -qiE "ValidatingAdmissionPolicy|RequestEntityTooLarge|10KiB|Pod annotation entries" "$err_file"; then
+                err "Annotation storm blocked by admission guardrail before etcd could grow."
+                warn "This is expected after './demo.sh guardrails'. Delete the VAPs or recreate the cluster before demonstrating the vulnerable path again."
+                warn "Admission denial:"
+                sed -n '1,5p' "$err_file" | sed 's/^/  /'
+                show_cmd "kubectl delete validatingadmissionpolicybinding pod-mvcc-write-guardrails pod-status-mvcc-guardrails"
+                show_cmd "kubectl delete validatingadmissionpolicy pod-mvcc-write-guardrails pod-status-mvcc-guardrails"
+                cleanup_annotation_workload
+                rm -f "$err_file"
+                return 1
+            elif quota_error_seen "$err_file"; then
+                warn "An annotation write failed with the quota error:"
+                sed -n '1p' "$err_file" | sed 's/^/  /'
+                rm -f "$err_file"
+                show_blocked_writes
+                break
+            else
+                warn "Annotation storm patch errors:"
+                sed -n '1,5p' "$err_file" | sed 's/^/  /'
+            fi
+            rm -f "$err_file"
+            break
+        fi
+        rm -f "$err_file"
+
+        if [[ "$metadata_guardrail_active" == "1" ]]; then
+            err "Metadata guardrail is installed, but the oversized annotation was accepted."
+            warn "Run './demo.sh guardrails' to re-apply and verify admission enforcement before using this as the prevention demo."
+            cleanup_annotation_workload
+            return 1
+        fi
 
         # Check if we've hit the quota. Reads still work during NOSPACE, so
         # use the etcd alarm instead of a kubectl get as the signal.
@@ -627,9 +897,52 @@ break_annotations() {
             break
         fi
 
-        echo -ne "\r  Iteration $iteration - 50 pods × 50KB annotation = ~3.2MB written to etcd per cycle"
-        sleep 2
+        local elapsed
+        elapsed=$(($(date +%s) - start_ts))
+        echo ""
+        echo "  Iteration $iteration | elapsed ${elapsed}s | $annotation_pod_count pods x $((ANNOTATION_PAYLOAD_BYTES / 1024))KiB annotation payload"
+        check_etcd_size || true
+
+        if (( elapsed >= ANNOTATION_DEADLINE_SECONDS )); then
+            echo ""
+            warn "Deadline reached before NOSPACE."
+            warn "For stage certainty, rerun with one of these:"
+            warn "  ANNOTATION_REPLICAS=80 ./demo.sh break-annotations"
+            warn "  ANNOTATION_PAYLOAD_BYTES=131072 ./demo.sh break-annotations"
+            warn "  Or use the primary status scenario: ./demo.sh break"
+            break
+        fi
+
+        if (( ANNOTATION_SLEEP_SECONDS > 0 )); then
+            sleep "$ANNOTATION_SLEEP_SECONDS"
+        fi
     done
+}
+
+write_annotation_patch_file() {
+    local iteration="$1"
+    local patch_file="$2"
+
+    python3 - "$ANNOTATION_PAYLOAD_BYTES" "$iteration" > "$patch_file" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+
+size = int(sys.argv[1])
+iteration = sys.argv[2]
+prefix = f"iteration={iteration};ts={datetime.now(timezone.utc).isoformat()};"
+value = (prefix + ("x" * max(0, size - len(prefix))))[:size]
+
+patch = {
+    "metadata": {
+        "annotations": {
+            "bloat.demo/data": value,
+        }
+    }
+}
+
+json.dump(patch, sys.stdout)
+PY
 }
 
 write_status_patch_file() {
@@ -693,18 +1006,36 @@ show_blocked_writes() {
     err "Run './demo.sh recover' to fix it"
 }
 
-# --- BREAK: Status Patch Storm ---
+# --- BREAK: Status Storm ---
 break_status() {
-    log "=== SCENARIO: Status Patch Storm ==="
-    log "Simulates a controller that writes high-churn data into pod status"
-    log "Replicas: $STATUS_REPLICAS | payload: $((STATUS_PAYLOAD_BYTES / 1024))KiB/pod | parallelism: $STATUS_PARALLELISM"
+    log "=== SCENARIO: Status Storm (break) ==="
+    log "High-churn pod status patches fill etcd with full-object revisions"
     log "Image: $STATUS_IMAGE"
     log ""
-    confirm_action "Status storm setup will:" \
-        "Reset namespace '$NAMESPACE' so the run starts clean" \
-        "Create deployment/status-victim using image '$STATUS_IMAGE'" \
-        "Scale it to $STATUS_REPLICAS pods" \
-        "Generate a $((STATUS_PAYLOAD_BYTES / 1024))KiB status patch payload"
+
+    local status_guardrail_active=0
+    local target_replicas="$STATUS_REPLICAS"
+    if status_guardrail_installed; then
+        status_guardrail_active=1
+        target_replicas=1
+        warn "Status guardrail is installed. This run should fail at admission before etcd grows."
+    fi
+
+    if [[ "$status_guardrail_active" == "1" ]]; then
+        log "Guarded probe: 1 pod | payload: $((STATUS_PAYLOAD_BYTES / 1024))KiB | unguarded storm defaults to $STATUS_REPLICAS pods"
+        confirm_action "Guarded status storm setup will:" \
+            "Reset demo-owned workloads in namespace '$NAMESPACE'" \
+            "Create one status-victim pod using image '$STATUS_IMAGE'" \
+            "Attempt a $((STATUS_PAYLOAD_BYTES / 1024))KiB status patch" \
+            "Stop after the admission denial proves the guardrail works"
+    else
+        log "Replicas: $STATUS_REPLICAS | payload: $((STATUS_PAYLOAD_BYTES / 1024))KiB/pod | parallelism: $STATUS_PARALLELISM"
+        confirm_action "Status storm setup will:" \
+            "Reset demo-owned workloads in namespace '$NAMESPACE'" \
+            "Create deployment/status-victim using image '$STATUS_IMAGE'" \
+            "Scale it to $STATUS_REPLICAS pods" \
+            "Generate a $((STATUS_PAYLOAD_BYTES / 1024))KiB status patch payload"
+    fi
 
     reset_demo_namespace
 
@@ -714,14 +1045,14 @@ break_status() {
         --image="$STATUS_IMAGE" \
         --namespace="$NAMESPACE" \
         --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-    show_cmd "kubectl scale deployment status-victim --replicas=$STATUS_REPLICAS -n $NAMESPACE"
-    kubectl scale deployment status-victim --replicas="$STATUS_REPLICAS" -n "$NAMESPACE" >/dev/null
+    show_cmd "kubectl scale deployment status-victim --replicas=$target_replicas -n $NAMESPACE"
+    kubectl scale deployment status-victim --replicas="$target_replicas" -n "$NAMESPACE" >/dev/null
 
     log "Waiting for pod objects to be created..."
     show_cmd "kubectl get pods -n $NAMESPACE -l app=status-victim"
     local pod_count
-    if ! pod_count=$(wait_for_status_pods); then
-        warn "Only found $pod_count/$STATUS_REPLICAS pods; patching the pods that exist."
+    if ! pod_count=$(wait_for_status_pods "$target_replicas"); then
+        warn "Only found $pod_count/$target_replicas pods; patching the pods that exist."
     fi
 
     local pods=()
@@ -737,32 +1068,54 @@ break_status() {
     log "Patching status on ${#pods[@]} pods as fast as the API server accepts it..."
     log "(This is what broken operators do: reconcile loops that always patch.)"
     log ""
-    confirm_action "Starting the status storm will:" \
-        "Patch ${#pods[@]} pod status subresources in parallel" \
-        "Write a new full pod revision to etcd on every successful patch" \
-        "Continue until etcd rejects writes or $STATUS_DEADLINE_SECONDS seconds elapse"
+    if [[ "$status_guardrail_active" == "1" ]]; then
+        confirm_action "Starting the guarded status storm will:" \
+            "Attempt one oversized pod status patch" \
+            "Show the ValidatingAdmissionPolicy denial" \
+            "Stop before writing high-churn status revisions into etcd"
+    else
+        confirm_action "Starting the status storm will:" \
+            "Patch ${#pods[@]} pod status subresources in parallel" \
+            "Write a new full pod revision to etcd on every successful patch" \
+            "Continue until etcd rejects writes or $STATUS_DEADLINE_SECONDS seconds elapse"
+    fi
 
     local patch_file
     local err_file
-    patch_file=$(mktemp "${TMPDIR:-/tmp}/mvcc-status-patch.XXXXXX.json")
-    err_file=$(mktemp "${TMPDIR:-/tmp}/mvcc-status-errors.XXXXXX.log")
+    patch_file=$(mktemp "${TMPDIR:-/tmp}/mvcc-status-patch.XXXXXX")
+    err_file=$(mktemp "${TMPDIR:-/tmp}/mvcc-status-errors.XXXXXX")
 
     log "Testing one status patch before starting the storm..."
     local patch_type="$STATUS_PATCH_TYPE"
+    local patch_output=""
     write_status_patch_file 0 "$patch_file"
     show_key_cmd "kubectl patch ${pods[0]} -n $NAMESPACE --subresource=status --type=$patch_type --patch-file=<${STATUS_PAYLOAD_BYTES}B payload>"
-    if ! kubectl patch "${pods[0]}" -n "$NAMESPACE" \
+    if ! patch_output=$(kubectl patch "${pods[0]}" -n "$NAMESPACE" \
         --subresource=status \
         --type="$patch_type" \
-        --patch-file="$patch_file" >/dev/null; then
+        --patch-file="$patch_file" 2>&1); then
+        echo "$patch_output" | sed 's/^/  /'
+        if status_guardrail_denial_seen <<<"$patch_output"; then
+            err "Status storm blocked by admission guardrail before etcd could grow."
+            cleanup_status_workload
+            rm -f "$patch_file" "$err_file"
+            return 1
+        fi
         if [[ "$patch_type" == "strategic" ]]; then
             warn "Strategic status patch failed; retrying with merge patch."
             patch_type="merge"
             show_key_cmd "kubectl patch ${pods[0]} -n $NAMESPACE --subresource=status --type=$patch_type --patch-file=<${STATUS_PAYLOAD_BYTES}B payload>"
-            if ! kubectl patch "${pods[0]}" -n "$NAMESPACE" \
+            if ! patch_output=$(kubectl patch "${pods[0]}" -n "$NAMESPACE" \
                 --subresource=status \
                 --type="$patch_type" \
-                --patch-file="$patch_file" >/dev/null; then
+                --patch-file="$patch_file" 2>&1); then
+                echo "$patch_output" | sed 's/^/  /'
+                if status_guardrail_denial_seen <<<"$patch_output"; then
+                    err "Status storm blocked by admission guardrail before etcd could grow."
+                    cleanup_status_workload
+                    rm -f "$patch_file" "$err_file"
+                    return 1
+                fi
                 err "The API server rejected the status patch. Try a smaller payload:"
                 err "  STATUS_PAYLOAD_BYTES=32768 ./demo.sh break"
                 rm -f "$patch_file" "$err_file"
@@ -774,6 +1127,14 @@ break_status() {
             rm -f "$patch_file" "$err_file"
             return 1
         fi
+    fi
+
+    if [[ "$status_guardrail_active" == "1" ]]; then
+        err "Status guardrail is installed, but the oversized status patch was accepted."
+        warn "Run './demo.sh guardrails' to re-apply and verify admission enforcement before using this as the prevention demo."
+        cleanup_status_workload
+        rm -f "$patch_file" "$err_file"
+        return 1
     fi
 
     local iteration=0
@@ -916,10 +1277,14 @@ recover() {
     echo ""
 
     log "Step 5: Verify cluster is writable"
-    show_key_cmd "kubectl create namespace recovery-test"
-    if kubectl create namespace recovery-test 2>/dev/null; then
-        show_cmd "kubectl delete namespace recovery-test --wait=false"
-        kubectl delete namespace recovery-test --wait=false 2>/dev/null || true
+    local probe_name
+    probe_name="mvcc-write-probe-$(date -u +%s)"
+    show_key_cmd "kubectl create configmap $probe_name -n $NAMESPACE --from-literal=ts=<now>"
+    if kubectl create configmap "$probe_name" \
+        -n "$NAMESPACE" \
+        --from-literal=ts="$(date -u +%s)" 2>/dev/null; then
+        show_cmd "kubectl delete configmap $probe_name -n $NAMESPACE --ignore-not-found --wait=false"
+        kubectl delete configmap "$probe_name" -n "$NAMESPACE" --ignore-not-found --wait=false 2>/dev/null || true
         log "✅ Cluster is writable again!"
     else
         err "Cluster still read-only. May need to restart etcd."
@@ -935,6 +1300,7 @@ guardrails() {
     log ""
     local metadata_guardrail_ok=0
     local status_guardrail_ok=0
+    local vap_admission_enabled=0
 
     confirm_action "Guardrails will:" \
         "Apply a native Kubernetes ValidatingAdmissionPolicy" \
@@ -959,6 +1325,21 @@ guardrails() {
         kubectl get validatingadmissionpolicybinding \
             pod-mvcc-write-guardrails \
             pod-status-mvcc-guardrails
+        log "Waiting for admission policy enforcement to become active..."
+        if wait_for_guardrail_enforcement; then
+            log "Admission policy enforcement is active."
+            vap_admission_enabled=1
+        else
+            warn "Admission policy was created, but the API server did not reject the readiness dry-run yet."
+            warn "Trying to enable ValidatingAdmissionPolicy on the running kind control plane..."
+            if enable_validating_admission_policy_live && wait_for_guardrail_enforcement; then
+                log "Admission policy enforcement is active after live kube-apiserver patch."
+                vap_admission_enabled=1
+            else
+                warn "Could not verify native admission enforcement on this running cluster."
+                warn "Manual fallback: recreate the demo cluster with './demo.sh cleanup' then './demo.sh setup'."
+            fi
+        fi
     else
         warn "This cluster does not expose ValidatingAdmissionPolicy."
         warn "Showing the native policy manifest instead of applying it."
@@ -976,12 +1357,19 @@ guardrails() {
     echo ""
 
     log "3. Testing the guardrail..."
-    if [[ -n "$vap_resource" ]]; then
+    if [[ -n "$vap_resource" && "$vap_admission_enabled" == "1" ]]; then
         local guardrail_output
         local blob
+        local metadata_test_pod="guardrail-test"
         blob=$(python3 -c "print('x' * 51200)")
-        show_key_cmd "kubectl run guardrail-test --image=$TEST_IMAGE -n $NAMESPACE --annotations=bloat.demo/huge=<50KiB> -- sleep 1"
-        guardrail_output=$(kubectl run guardrail-test --image="$TEST_IMAGE" -n $NAMESPACE \
+        show_cmd "kubectl delete pod $metadata_test_pod -n $NAMESPACE --ignore-not-found --wait=false --grace-period=0"
+        kubectl delete pod "$metadata_test_pod" -n "$NAMESPACE" --ignore-not-found --wait=false --grace-period=0 >/dev/null 2>&1 || true
+        if kubectl get pod "$metadata_test_pod" -n "$NAMESPACE" >/dev/null 2>&1; then
+            metadata_test_pod="guardrail-test-${RANDOM}"
+            warn "Previous guardrail-test is still deleting; using $metadata_test_pod for this run."
+        fi
+        show_key_cmd "kubectl run $metadata_test_pod --image=$TEST_IMAGE -n $NAMESPACE --annotations=bloat.demo/huge=<50KiB> -- sleep 1"
+        guardrail_output=$(kubectl run "$metadata_test_pod" --image="$TEST_IMAGE" -n $NAMESPACE \
             --annotations="bloat.demo/huge=$blob" \
             --command -- sleep 1 2>&1 || true)
         echo "$guardrail_output" | sed 's/^/  /'
@@ -995,22 +1383,27 @@ guardrails() {
 
         local status_patch_file
         local status_guardrail_output
-        status_patch_file=$(mktemp "${TMPDIR:-/tmp}/mvcc-status-guardrail.XXXXXX.json")
+        local status_test_pod="guardrail-status-test"
+        status_patch_file=$(mktemp "${TMPDIR:-/tmp}/mvcc-status-guardrail.XXXXXX")
         write_status_patch_file "guardrail" "$status_patch_file"
 
-        show_cmd "kubectl delete pod guardrail-status-test -n $NAMESPACE --ignore-not-found --wait=false"
-        kubectl delete pod guardrail-status-test -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
-        show_key_cmd "kubectl run guardrail-status-test --image=$STATUS_IMAGE -n $NAMESPACE"
-        kubectl run guardrail-status-test --image="$STATUS_IMAGE" -n "$NAMESPACE" >/dev/null
-        show_key_cmd "kubectl patch pod/guardrail-status-test -n $NAMESPACE --subresource=status --type=merge --patch-file=<${STATUS_PAYLOAD_BYTES}B payload>"
-        status_guardrail_output=$(kubectl patch pod/guardrail-status-test -n "$NAMESPACE" \
+        show_cmd "kubectl delete pod $status_test_pod -n $NAMESPACE --ignore-not-found --wait=false --grace-period=0"
+        kubectl delete pod "$status_test_pod" -n "$NAMESPACE" --ignore-not-found --wait=false --grace-period=0 >/dev/null 2>&1 || true
+        if kubectl get pod "$status_test_pod" -n "$NAMESPACE" >/dev/null 2>&1; then
+            status_test_pod="guardrail-status-test-${RANDOM}"
+            warn "Previous guardrail-status-test is still deleting; using $status_test_pod for this run."
+        fi
+        show_key_cmd "kubectl run $status_test_pod --image=$STATUS_IMAGE -n $NAMESPACE"
+        kubectl run "$status_test_pod" --image="$STATUS_IMAGE" -n "$NAMESPACE" >/dev/null
+        show_key_cmd "kubectl patch pod/$status_test_pod -n $NAMESPACE --subresource=status --type=merge --patch-file=<${STATUS_PAYLOAD_BYTES}B payload>"
+        status_guardrail_output=$(kubectl patch "pod/$status_test_pod" -n "$NAMESPACE" \
             --subresource=status \
             --type=merge \
             --patch-file="$status_patch_file" 2>&1 || true)
         echo "$status_guardrail_output" | sed 's/^/  /'
         rm -f "$status_patch_file"
-        show_cmd "kubectl delete pod guardrail-status-test -n $NAMESPACE --ignore-not-found --wait=false"
-        kubectl delete pod guardrail-status-test -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+        show_cmd "kubectl delete pod $status_test_pod -n $NAMESPACE --ignore-not-found --wait=false --grace-period=0"
+        kubectl delete pod "$status_test_pod" -n "$NAMESPACE" --ignore-not-found --wait=false --grace-period=0 >/dev/null 2>&1 || true
 
         if grep -qiE "denied the request|10KiB|status condition messages|High-churn status payloads" <<<"$status_guardrail_output"; then
             log "✅ Status guardrail working - bloated status patch rejected"
@@ -1018,13 +1411,20 @@ guardrails() {
         else
             warn "Status guardrail test was not rejected. Check ValidatingAdmissionPolicy status."
         fi
+    elif [[ -n "$vap_resource" ]]; then
+        warn "Live rejection test skipped because native admission enforcement could not be verified."
     else
         warn "Live rejection test skipped because native admission policy is unavailable."
     fi
 
     if [[ "$metadata_guardrail_ok" != "1" || "$status_guardrail_ok" != "1" ]]; then
         err "Admission guardrail was not verified."
-        warn "This should work on recent kind/Kubernetes clusters with ValidatingAdmissionPolicy enabled."
+        if [[ "$vap_admission_enabled" != "1" ]]; then
+            warn "The script tried to verify and repair the running control plane, but enforcement still was not active."
+            warn "Manual fallback: recreate the demo cluster with './demo.sh cleanup' then './demo.sh setup'."
+        else
+            warn "ValidatingAdmissionPolicy is enabled; inspect policy status and CEL expressions."
+        fi
         return 1
     fi
 
@@ -1055,7 +1455,7 @@ size() {
 # --- GUIDED A-Z DEMO ---
 guided_demo() {
     log "=== Guided A-Z Demo ==="
-    log "Run a full stage flow: setup → observe → break → recover → guardrails."
+    log "Run a full stage flow: setup → observe → status storm (break) → recover → guardrails."
     log "Run a specific scenario, such as './demo.sh break', to skip this guided flow."
 
     confirm_action "Guided demo will:" \
@@ -1064,19 +1464,28 @@ guided_demo() {
         "Pause so you can start './demo.sh monitor' in a second terminal" \
         "Run the status patch storm until writes fail" \
         "Recover etcd with compact, defrag, and alarm disarm" \
+        "Clean up the recovered storm workload" \
         "Deploy guardrail examples"
+
+    local previous_section_prompt="$DEMO_SECTION_PROMPT"
+    DEMO_SECTION_PROMPT=0
 
     setup
     size
 
-    confirm_action "Before the break scenario:" \
+    DEMO_SECTION_PROMPT="$previous_section_prompt"
+    confirm_action "Before the status storm (break) scenario:" \
         "Open a second terminal if you want live monitoring" \
         "Run: ./demo.sh monitor" \
         "Come back here and continue when the monitor is visible"
+    DEMO_SECTION_PROMPT=0
 
+    remove_native_guardrails_for_vulnerable_demo
     break_status
     recover
+    cleanup_recovered_storm_workload
     guardrails
+    DEMO_SECTION_PROMPT="$previous_section_prompt"
 
     if ask_yes_no "Optional cleanup:" \
         "Delete the kind cluster '$CLUSTER_NAME'" \
@@ -1112,10 +1521,11 @@ case "${REQUESTED_SCENARIO:-guided}" in
         echo "Set DEMO_COMMAND_PAUSE=major, all, or 0 to control Enter pauses before commands."
         echo ""
         echo "Scenarios (run in order):"
-        echo "  guided      - Full guided flow: setup, size, break, recover, guardrails"
+        echo "  guided      - Full guided flow: setup, size, status storm, recover, guardrails"
         echo "  setup       - Create kind cluster with 100MB etcd quota"
-        echo "  break       - Stage path: pod status patch storm (fills etcd)"
-        echo "  break-annotations - Alternative: annotation patch storm"
+        echo "  break       - Status storm: high-churn pod status patches fill etcd"
+        echo "  break-status - Same as break (compatibility alias)"
+        echo "  break-annotations - Annotation storm: high-churn pod annotation patches fill etcd"
         echo "  monitor     - Watch etcd size in real-time (run in separate terminal)"
         echo "  recover     - Walk through recovery procedure"
         echo "  guardrails  - Deploy prevention (native admission policy + Prometheus alerts)"

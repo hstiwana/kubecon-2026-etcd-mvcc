@@ -17,6 +17,7 @@ spec:
       - pods
   validations:
   - expression: >-
+      has(object.metadata.deletionTimestamp) ||
       !has(object.metadata.annotations) ||
       object.metadata.annotations.all(key,
         key.size() + object.metadata.annotations[key].size() <= 10240
@@ -26,6 +27,7 @@ spec:
       Pod annotation entries must be 10KiB or smaller. Large annotations cause
       etcd MVCC bloat; move high-churn data to a separate CRD.
   - expression: >-
+      has(object.metadata.deletionTimestamp) ||
       !has(object.metadata.labels) ||
       object.metadata.labels.all(key,
         key.size() + object.metadata.labels[key].size() <= 2048
@@ -62,6 +64,7 @@ spec:
       - pods/status
   validations:
   - expression: >-
+      has(object.metadata.deletionTimestamp) ||
       !has(object.status.conditions) ||
       object.status.conditions.all(condition,
         !has(condition.message) || condition.message.size() <= 10240

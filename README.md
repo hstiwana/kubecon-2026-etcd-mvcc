@@ -24,7 +24,7 @@ You'll see:
 ## Quick Start
 
 ```bash
-# Guided stage flow: setup → size → break → recover → guardrails
+# Guided stage flow: setup → size → break → recover → cleanup → guardrails
 ./demo.sh
 
 # If you already had this demo cluster, use this instead so kind picks up
@@ -44,11 +44,16 @@ To run one section directly without the guided prompts:
 ./demo.sh guardrails
 ```
 
+Guided mode removes any existing native admission guardrails before the vulnerable
+`break` step, then reapplies them at the end. If you run `./demo.sh break`
+directly after `./demo.sh guardrails`, the storm should fail immediately at
+admission. That is the prevention proof.
+
 ## Validated Results
 
 ```
 $ ./demo.sh break
-[DEMO] === SCENARIO: Status Patch Storm ===
+[DEMO] === SCENARIO: Status Storm (break) ===
 [DEMO] Replicas: 80 | payload: 96KiB/pod | parallelism: 20
 [DEMO] Patching status on 80 pods as fast as the API server accepts it...
 
@@ -87,6 +92,11 @@ STATUS_PAYLOAD_BYTES=98304   # 96KiB condition message per pod
 STATUS_PARALLELISM=20
 STATUS_DEADLINE_SECONDS=90
 STATUS_IMAGE=registry.k8s.io/pause:3.10
+ANNOTATION_REPLICAS=50
+ANNOTATION_PAYLOAD_BYTES=98304
+ANNOTATION_PARALLELISM=25
+ANNOTATION_SLEEP_SECONDS=0
+ANNOTATION_DEADLINE_SECONDS=90
 TEST_IMAGE=busybox:latest
 DEMO_PROMPT=<auto>         # no args: prompts on; explicit scenario: prompts off
 DEMO_COMMAND_PAUSE=<auto>  # no args: major; explicit scenario: 0
@@ -183,11 +193,11 @@ $ etcdctl defrag
 $ etcdctl alarm disarm
   memberID:2583549131277751082 alarm:NOSPACE
 
-$ kubectl create namespace recovery-test
-  namespace/recovery-test created   ← cluster is back
+$ kubectl create configmap mvcc-write-probe-<ts> -n mvcc-demo --from-literal=ts=<now>
+  configmap/mvcc-write-probe-<ts> created   ← cluster is back
 
-$ kubectl delete namespace recovery-test --wait=false
-  namespace "recovery-test" deleted
+$ kubectl delete configmap mvcc-write-probe-<ts> -n mvcc-demo --ignore-not-found --wait=false
+  configmap "mvcc-write-probe-<ts>" deleted
 ```
 
 ## Business Impact
@@ -347,9 +357,10 @@ This isolates high-frequency writes to objects that are small and disposable, ke
 
 | Scenario | What It Shows | Time to Break |
 |----------|--------------|---------------|
-| `guided` or no argument | Full stage flow with prompts: setup → size → break → recover → guardrails | End-to-end |
-| `break` | Stage path: pod status storm - simulates a broken controller | ~45-90 seconds |
-| `break-annotations` | Annotation patch storm for comparison | Hardware-dependent |
+| `guided` or no argument | Full stage flow with prompts: setup → size → status storm → recover → cleanup → guardrails | End-to-end |
+| `break` | Status storm: high-churn pod status patches fill etcd; after guardrails, proves admission blocks it | ~45-90 seconds unguarded |
+| `break-status` | Compatibility alias for `break` | Same as `break` |
+| `break-annotations` | Annotation storm: high-churn pod annotation patches fill etcd; after guardrails, proves admission blocks it | ~20-40 seconds unguarded |
 | `recover` | Full recovery: compact → defrag → disarm | ~30 seconds |
 | `guardrails` | Native admission policy + Prometheus alerts | Instant |
 | `offline-prep` | Cache manifests/images before the conference | Prep step |

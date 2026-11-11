@@ -9,6 +9,11 @@ nodes:
   kubeadmConfigPatches:
   - |
     kind: ClusterConfiguration
+    apiServer:
+      extraArgs:
+        # Required for the native guardrail demo. The API resource can exist
+        # without this admission plugin actually enforcing policies.
+        enable-admission-plugins: "NodeRestriction,ValidatingAdmissionPolicy"
     etcd:
       local:
         extraArgs:
